@@ -1,9 +1,8 @@
 import "dart:async";
 import "dart:convert";
-import "dart:io";
 import "dart:math";
-import "dart:typed_data";
 
+import "package:flutter/foundation.dart";
 import "package:flutter_secure_storage/flutter_secure_storage.dart";
 import "package:http/http.dart" as http;
 import "package:shared_preferences/shared_preferences.dart";
@@ -51,7 +50,7 @@ class ApiClient {
   static const _serverTokenKey = "stokli_server_session_token";
   static const defaultEndpoint = String.fromEnvironment(
     "STOKLI_API_BASE_URL",
-    defaultValue: "http://10.0.2.2/Stokli%20BMC/api/index.php",
+    defaultValue: kIsWeb ? "" : "http://10.0.2.2/Stokli%20BMC/api/index.php",
   );
 
   final SharedPreferences _preferences;
@@ -64,23 +63,33 @@ class ApiClient {
   String? _serverToken;
   String? _accountId;
   bool _offlineMode = false;
+  String? _syncError;
+  DateTime? _lastReconnectAttempt;
+  Future<bool>? _reconnectTask;
 
   bool get hasToken => _token != null;
 
   static Future<ApiClient> create() async {
     final preferences = await SharedPreferences.getInstance();
     final client = ApiClient._(preferences);
-    client._offlineMode = preferences.getBool(_offlineKey) ?? false;
+    client._offlineMode =
+        (kIsWeb && defaultEndpoint.isEmpty) ||
+        (preferences.getBool(_offlineKey) ?? false);
     client._token = await client._secureStorage.read(key: _tokenKey);
     client._serverToken = await client._secureStorage.read(
       key: _serverTokenKey,
     );
     client._accountId = preferences.getString(_accountIdKey);
     await client.localStore.initialize();
+    if (client._offlineMode && !client.isWebDemo) {
+      await client._tryReconnect();
+    }
     return client;
   }
 
   bool get isOffline => _offlineMode;
+  bool get isWebDemo => kIsWeb && defaultEndpoint.isEmpty;
+  String? get syncError => _syncError;
   Future<int> get pendingSyncCount => localStore.pendingOperationCount();
 
   Future<JsonMap> getCachedEquipmentPage({int limit = 30}) =>
@@ -99,11 +108,10 @@ class ApiClient {
   }
 
   Future<JsonMap> login({
-    required String role,
     required String accountId,
     required String password,
   }) async {
-    final body = {"role": role, "account_id": accountId, "password": password};
+    final body = {"account_id": accountId, "password": password};
     late JsonMap result;
     if (_offlineMode) {
       result = await localStore.post("login", body, "");
@@ -169,36 +177,6 @@ class ApiClient {
     if (_token != null) "Authorization": "Bearer $_token",
   };
 
-  Future<JsonMap> register({
-    required String accountId,
-    required String fullName,
-    required String password,
-  }) async {
-    final body = {
-      "account_id": accountId,
-      "full_name": fullName,
-      "password": password,
-    };
-    if (_offlineMode) {
-      throw const ApiException(
-        "Connect to the server before creating a new account.",
-        statusCode: 503,
-      );
-    }
-    try {
-      final response = await _remoteRequest("POST", "register", body: body);
-      await localStore.cacheRegisteredUser(
-        accountId: accountId,
-        fullName: fullName,
-        password: password,
-      );
-      return response;
-    } on ApiException catch (error) {
-      if (error.statusCode != null && error.statusCode! < 500) rethrow;
-      rethrow;
-    }
-  }
-
   Future<void> logout() async {
     try {
       if (_token != null && !_offlineMode) {
@@ -206,14 +184,17 @@ class ApiClient {
       }
     } finally {
       _token = null;
-      _offlineMode = false;
-      await _preferences.setBool(_offlineKey, false);
+      _offlineMode = isWebDemo;
+      await _preferences.setBool(_offlineKey, isWebDemo);
       await _preferences.remove(_offlineUserKey);
       await _secureStorage.delete(key: _tokenKey);
     }
   }
 
   Future<JsonMap> get(String action) async {
+    if (_offlineMode) {
+      await _tryReconnect();
+    }
     if (_offlineMode) {
       final local = await localStore.get(action, _token ?? "");
       final user = _asMap((await localStore.me(_token ?? ""))["user"]);
@@ -459,12 +440,16 @@ class ApiClient {
   }
 
   Future<JsonMap> post(String action, JsonMap body) async {
+    if (_offlineMode && !isWebDemo) {
+      await _tryReconnect();
+    }
     if (action == "return_photo") {
       if (_offlineMode) return localStore.post(action, body, _token ?? "");
       return _remoteRequest("POST", action, body: body);
     }
     if (action == "change_password") {
       if (_offlineMode) {
+        if (kIsWeb) return localStore.post(action, body, _token ?? "");
         throw const ApiException(
           "Internet connection required to change your password.",
           statusCode: 503,
@@ -553,14 +538,19 @@ class ApiClient {
   }
 
   Future<void> reconnectAndSync({
-    required String role,
     required String accountId,
     required String password,
   }) async {
+    if (isWebDemo) {
+      throw const ApiException(
+        "Browser offline mode uses local storage and does not connect to MySQL.",
+        statusCode: 503,
+      );
+    }
     final response = await _remoteRequest(
       "POST",
       "login",
-      body: {"role": role, "account_id": accountId, "password": password},
+      body: {"account_id": accountId, "password": password},
     );
     final remoteUser = _asMap(response["user"]);
     if (remoteUser["account_id"] != (_accountId ?? accountId)) {
@@ -583,10 +573,68 @@ class ApiClient {
     await _preferences.setBool(_offlineKey, false);
     await _secureStorage.write(key: _serverTokenKey, value: token);
     await _secureStorage.write(key: _tokenKey, value: token);
+    _syncError = null;
     await _replayOutbox();
     final current = _asMap((await _remoteRequest("GET", "me"))["user"]);
     final localUserId = await localStore.cacheUser(current, password);
     await _preferences.setInt(_offlineUserKey, localUserId);
+  }
+
+  Future<bool> _tryReconnect() {
+    if (isWebDemo || _accountId == null || _serverToken == null) {
+      return Future.value(false);
+    }
+    final active = _reconnectTask;
+    if (active != null) return active;
+    final lastAttempt = _lastReconnectAttempt;
+    if (lastAttempt != null &&
+        DateTime.now().difference(lastAttempt) < const Duration(seconds: 15)) {
+      return Future.value(false);
+    }
+    _lastReconnectAttempt = DateTime.now();
+    final task = _restoreRemoteSession();
+    _reconnectTask = task;
+    return task.whenComplete(() => _reconnectTask = null);
+  }
+
+  Future<bool> _restoreRemoteSession() async {
+    final serverToken = _serverToken;
+    final accountId = _accountId;
+    final localToken = _token;
+    if (serverToken == null || accountId == null) return false;
+
+    _token = serverToken;
+    try {
+      final response = await _remoteRequest(
+        "GET",
+        "me",
+        timeout: const Duration(seconds: 3),
+      );
+      final remoteUser = _asMap(response["user"]);
+      if (remoteUser["account_id"] != accountId) {
+        _token = localToken;
+        _syncError =
+            "Reconnect with the same account used for offline changes.";
+        return false;
+      }
+      _offlineMode = false;
+      await _preferences.setBool(_offlineKey, false);
+      await _secureStorage.write(key: _tokenKey, value: serverToken);
+      _syncError = null;
+      try {
+        await _replayOutbox();
+      } on ApiException catch (error) {
+        _syncError = error.message;
+      }
+      return true;
+    } on ApiException catch (error) {
+      _token = localToken;
+      if (error.statusCode != null &&
+          (error.statusCode == 401 || error.statusCode == 403)) {
+        _syncError = "Your server session expired. Tap Sync and sign in again.";
+      }
+      return false;
+    }
   }
 
   Future<void> _replayOutbox() async {
@@ -652,6 +700,7 @@ class ApiClient {
     JsonMap? body,
     String? idempotencyKey,
     Map<String, String>? queryParameters,
+    Duration timeout = const Duration(seconds: 20),
   }) async {
     final endpointUri = Uri.parse(defaultEndpoint);
     final uri = endpointUri.replace(
@@ -667,23 +716,17 @@ class ApiClient {
     try {
       switch (method) {
         case "GET":
-          response = await _client
-              .get(uri, headers: headers)
-              .timeout(const Duration(seconds: 20));
+          response = await _client.get(uri, headers: headers).timeout(timeout);
         case "POST":
           response = await _client
               .post(uri, headers: headers, body: jsonEncode(body))
-              .timeout(const Duration(seconds: 20));
+              .timeout(timeout);
         default:
           throw const ApiException("Unsupported API request.");
       }
-    } on SocketException {
-      throw const ApiException(
-        "Cannot reach the Stokli server. Check XAMPP, your network, and the server URL.",
-      );
     } on http.ClientException {
       throw const ApiException(
-        "The server connection failed. Check XAMPP and the server URL.",
+        "The server connection failed. Check your network and server URL.",
       );
     } on TimeoutException {
       throw const ApiException(

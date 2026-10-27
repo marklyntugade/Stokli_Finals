@@ -208,16 +208,6 @@ CREATE TABLE IF NOT EXISTS api_idempotency (
   CONSTRAINT fk_idempotency_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
-INSERT IGNORE INTO users (id, account_id, full_name, password_hash, role, program_section, contact_number) VALUES
-(1, 'STUDENT-001', 'Demo Student 1', '$2y$10$XKtSxVGo47aGAfFroPCJSO4XLiZNzw8/gZBezsnr1cYIzIzRjyePK', 'student', 'BSIT 204', NULL),
-(2, 'STUDENT-002', 'Demo Student 2', '$2y$10$XKtSxVGo47aGAfFroPCJSO4XLiZNzw8/gZBezsnr1cYIzIzRjyePK', 'student', 'BSIT 204', NULL),
-(3, 'STUDENT-003', 'Demo Student 3', '$2y$10$XKtSxVGo47aGAfFroPCJSO4XLiZNzw8/gZBezsnr1cYIzIzRjyePK', 'student', 'BSIT 204', NULL),
-(4, 'STUDENT-004', 'Demo Student 4', '$2y$10$XKtSxVGo47aGAfFroPCJSO4XLiZNzw8/gZBezsnr1cYIzIzRjyePK', 'student', 'BSIT 204', NULL),
-(5, 'STUDENT-005', 'Demo Student 5', '$2y$10$XKtSxVGo47aGAfFroPCJSO4XLiZNzw8/gZBezsnr1cYIzIzRjyePK', 'student', 'BSIT 204', NULL),
-(6, 'STUDENT-006', 'Demo Student 6', '$2y$10$XKtSxVGo47aGAfFroPCJSO4XLiZNzw8/gZBezsnr1cYIzIzRjyePK', 'student', 'BSIT 204', NULL),
-(7, 'ADMIN-001', 'Demo Admin 1', '$2y$10$6S7DRjwWlKppbvMbXYkMouwfA5PftKlnw2L9x.3EplCSPiSOrXFkC', 'admin', NULL, NULL),
-(8, 'ADMIN-002', 'Demo Admin 2', '$2y$10$6S7DRjwWlKppbvMbXYkMouwfA5PftKlnw2L9x.3EplCSPiSOrXFkC', 'admin', NULL, NULL);
-
 INSERT IGNORE INTO equipment (id, equipment_code, name, brand, category, program, total_stock, item_condition, image_asset) VALUES
 (1, 'STK-001', 'Display Port', 'Stokli', 'Cables', 'IT Laboratory', 5, 'Good', 'display-port.jpg'),
 (2, 'STK-002', 'RGB Keyboard', 'Stokli', 'Peripherals', 'IT Laboratory', 3, 'Good', 'rgb-keyboard.jpg'),
@@ -227,24 +217,3 @@ INSERT IGNORE INTO equipment (id, equipment_code, name, brand, category, program
 (6, 'STK-006', 'Screw Driver Set', 'Stokli', 'Tools', 'IT Laboratory', 3, 'Good', 'screw-driver-set.jpg'),
 (7, 'STK-007', 'Thermal Paste', 'Stokli', 'Tools', 'IT Laboratory', 5, 'Good', 'thermal-paste.jpg'),
 (8, 'STK-008', 'VGA Port', 'Stokli', 'Cables', 'IT Laboratory', 4, 'Good', 'vga-port.jpg');
-
-INSERT IGNORE INTO borrowing_requests (id, request_code, user_id, equipment_id, status, requested_at, reviewed_at) VALUES
-(1, 'REQ-2026-0051', 1, 3, 'pending', NOW() - INTERVAL 30 MINUTE, NULL),
-(2, 'REQ-2026-0052', 4, 7, 'pending', NOW() - INTERVAL 20 MINUTE, NULL),
-(3, 'REQ-2026-0053', 5, 8, 'pending', NOW() - INTERVAL 10 MINUTE, NULL),
-(4, 'REQ-2026-0048', 1, 1, 'approved', NOW() - INTERVAL 1 DAY, NOW() - INTERVAL 1 DAY);
-
-INSERT IGNORE INTO borrowing_transactions (id, transaction_code, request_id, user_id, equipment_id, borrowed_at, due_at, status) VALUES
-(1, 'BOR-2026-0001', 4, 1, 1, NOW() - INTERVAL 2 HOUR, NOW() + INTERVAL 6 HOUR, 'active');
-
-INSERT IGNORE INTO penalties (id, user_id, transaction_id, amount, reason, status) VALUES
-(1, 1, NULL, 200.00, 'Outstanding equipment penalty', 'unpaid');
-
-INSERT IGNORE INTO inventory_exceptions (id, equipment_id, reported_by, exception_type, quantity, notes, status) VALUES
-(1, 4, 7, 'damaged', 1, 'Speaker is under staff review.', 'open'),
-(2, 8, 7, 'missing', 1, 'Reported missing during stock check.', 'open');
-
-INSERT IGNORE INTO system_logs (id, actor_id, action, entity_type, entity_id, details) VALUES
-(1, 7, 'system.seeded', 'database', NULL, 'Initial Stokli inventory and demo records imported.'),
-(2, 1, 'request.created', 'borrowing_request', 1, 'Seeded pending request for demonstration.'),
-(3, 7, 'inventory.exception.created', 'equipment', 8, 'Seeded missing equipment exception.');

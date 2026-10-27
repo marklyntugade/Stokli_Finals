@@ -1,0 +1,12 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Stokli BMC (Flutter)",
+      "type": "dart",
+      "request": "launch",
+      "program": "${workspaceFolder}\\mobile\\lib\\main.dart",
+      "cwd": "${workspaceFolder}\\mobile"
+    }
+  ]
+}

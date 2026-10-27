@@ -1,6 +1,5 @@
 import "dart:async";
 import "dart:convert";
-import "dart:io";
 
 import "package:flutter/material.dart";
 import "package:flutter/services.dart";
@@ -13,6 +12,7 @@ import "package:shared_preferences/shared_preferences.dart";
 
 import "api_exception.dart";
 import "api_client.dart";
+import "database_factory_setup.dart";
 import "help_support.dart";
 
 const _navy = Color(0xFF123B57);
@@ -21,6 +21,7 @@ const _background = Color(0xFFF2F5F9);
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await initializeDatabaseFactory();
   final api = await ApiClient.create();
   runApp(StokliApp(api: api));
 }
@@ -196,11 +197,7 @@ class LoginScreen extends StatefulWidget {
 class _LoginScreenState extends State<LoginScreen> {
   final _formKey = GlobalKey<FormState>();
   final _id = TextEditingController();
-  final _name = TextEditingController();
   final _password = TextEditingController();
-  final _confirm = TextEditingController();
-  String _role = "student";
-  bool _registering = false;
   bool _working = false;
   bool _showPassword = false;
   String? _message;
@@ -215,9 +212,7 @@ class _LoginScreenState extends State<LoginScreen> {
   @override
   void dispose() {
     _id.dispose();
-    _name.dispose();
     _password.dispose();
-    _confirm.dispose();
     super.dispose();
   }
 
@@ -228,28 +223,11 @@ class _LoginScreenState extends State<LoginScreen> {
       _message = null;
     });
     try {
-      if (_registering) {
-        await widget.api.register(
-          accountId: _id.text.trim(),
-          fullName: _name.text.trim(),
-          password: _password.text,
-        );
-        if (!mounted) return;
-        setState(() {
-          _registering = false;
-          _password.clear();
-          _confirm.clear();
-          _message = "Account created. Sign in with your new credentials.";
-          _isError = false;
-        });
-      } else {
-        final user = await widget.api.login(
-          role: _role,
-          accountId: _id.text.trim(),
-          password: _password.text,
-        );
-        await widget.onSignedIn(user);
-      }
+      final user = await widget.api.login(
+        accountId: _id.text.trim(),
+        password: _password.text,
+      );
+      await widget.onSignedIn(user);
     } on ApiException catch (error) {
       if (mounted) {
         setState(() {
@@ -285,9 +263,7 @@ class _LoginScreenState extends State<LoginScreen> {
                           crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: [
                             Text(
-                              _registering
-                                  ? "Create student account"
-                                  : "Sign in to your account",
+                              "Sign in to your account",
                               style: Theme.of(context).textTheme.titleLarge
                                   ?.copyWith(
                                     color: Theme.of(context)
@@ -298,9 +274,7 @@ class _LoginScreenState extends State<LoginScreen> {
                             ),
                             const SizedBox(height: 6),
                             Text(
-                              _registering
-                                  ? "Register with your student ID."
-                                  : "Choose your account type to continue.",
+                              "Use your account ID and password to continue.",
                               style: TextStyle(
                                 color: Theme.of(context)
                                     .colorScheme
@@ -308,51 +282,12 @@ class _LoginScreenState extends State<LoginScreen> {
                               ),
                             ),
                             const SizedBox(height: 20),
-                            if (!_registering) ...[
-                              SegmentedButton<String>(
-                                segments: const [
-                                  ButtonSegment(
-                                    value: "student",
-                                    label: Text("Student"),
-                                    icon: Icon(Icons.school_outlined),
-                                  ),
-                                  ButtonSegment(
-                                    value: "admin",
-                                    label: Text("Admin"),
-                                    icon: Icon(
-                                      Icons.admin_panel_settings_outlined,
-                                    ),
-                                  ),
-                                ],
-                                selected: {_role},
-                                onSelectionChanged: (value) =>
-                                    setState(() => _role = value.first),
-                              ),
-                              const SizedBox(height: 16),
-                            ],
-                            if (_registering) ...[
-                              TextFormField(
-                                controller: _name,
-                                textCapitalization: TextCapitalization.words,
-                                decoration: const InputDecoration(
-                                  labelText: "Full name",
-                                  prefixIcon: Icon(Icons.person_outline),
-                                ),
-                                validator: (value) =>
-                                    value == null || value.trim().isEmpty
-                                    ? "Enter your full name."
-                                    : null,
-                              ),
-                              const SizedBox(height: 13),
-                            ],
                             TextFormField(
                               controller: _id,
                               textInputAction: TextInputAction.next,
-                              decoration: InputDecoration(
-                                labelText: _registering || _role == "student"
-                                    ? "Student ID"
-                                    : "Admin ID",
-                                prefixIcon: const Icon(Icons.badge_outlined),
+                              decoration: const InputDecoration(
+                                labelText: "Account ID",
+                                prefixIcon: Icon(Icons.badge_outlined),
                               ),
                               validator: (value) =>
                                   value == null || value.trim().isEmpty
@@ -363,15 +298,10 @@ class _LoginScreenState extends State<LoginScreen> {
                             TextFormField(
                               controller: _password,
                               obscureText: !_showPassword,
-                              textInputAction: _registering
-                                  ? TextInputAction.next
-                                  : TextInputAction.done,
-                              onFieldSubmitted: (_) =>
-                                  _registering ? null : _submit(),
+                              textInputAction: TextInputAction.done,
+                              onFieldSubmitted: (_) => _submit(),
                               decoration: InputDecoration(
-                                labelText: _registering
-                                    ? "New password"
-                                    : "Password",
+                                labelText: "Password",
                                 prefixIcon: const Icon(Icons.key_outlined),
                                 suffixIcon: IconButton(
                                   onPressed: () => setState(
@@ -384,31 +314,11 @@ class _LoginScreenState extends State<LoginScreen> {
                                   ),
                                 ),
                               ),
-                              validator: (value) {
-                                if (value == null || value.isEmpty) {
-                                  return "Enter your password.";
-                                }
-                                if (_registering &&
-                                    !_strongPassword.hasMatch(value)) {
-                                  return "Use 8+ characters with upper, lower, number, and symbol.";
-                                }
-                                return null;
-                              },
+                              validator: (value) =>
+                                  value == null || value.isEmpty
+                                  ? "Enter your password."
+                                  : null,
                             ),
-                            if (_registering) ...[
-                              const SizedBox(height: 13),
-                              TextFormField(
-                                controller: _confirm,
-                                obscureText: !_showPassword,
-                                decoration: const InputDecoration(
-                                  labelText: "Confirm password",
-                                  prefixIcon: Icon(Icons.lock_outline),
-                                ),
-                                validator: (value) => value != _password.text
-                                    ? "Passwords do not match."
-                                    : null,
-                              ),
-                            ],
                             const SizedBox(height: 16),
                             if (_message != null) ...[
                               const SizedBox(height: 4),
@@ -433,27 +343,9 @@ class _LoginScreenState extends State<LoginScreen> {
                                           color: Colors.white,
                                         ),
                                       )
-                                    : Text(
-                                        _registering
-                                            ? "Create account"
-                                            : "Sign in",
-                                      ),
+                                    : const Text("Sign in"),
                               ),
                             ),
-                            if (_role == "student" || _registering)
-                              TextButton(
-                                onPressed: _working
-                                    ? null
-                                    : () => setState(() {
-                                        _registering = !_registering;
-                                        _message = null;
-                                      }),
-                                child: Text(
-                                  _registering
-                                      ? "Already registered? Sign in"
-                                      : "Create a student account",
-                                ),
-                              ),
                           ],
                         ),
                       ),
@@ -515,12 +407,26 @@ class _HomeShellState extends State<HomeShell> {
   bool _equipmentHasMore = true;
   List<String> _equipmentCategories = [];
   Future<void>? _refreshTask;
+  Timer? _queueRefreshTimer;
   bool _savingProfile = false;
 
   @override
   void initState() {
     super.initState();
     _refresh();
+    if (_admin) {
+      _queueRefreshTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+        if (mounted && const {2, 3, 4}.contains(_tab)) {
+          unawaited(_refreshTransactions());
+        }
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _queueRefreshTimer?.cancel();
+    super.dispose();
   }
 
   List<JsonMap> _list(JsonMap response, String key) {
@@ -552,6 +458,7 @@ class _HomeShellState extends State<HomeShell> {
           _equipmentCategories = _stringList(cachedEquipment["categories"]);
         });
       }
+
       if (_admin) {
         final results = await Future.wait([
           widget.api.getEquipmentPage(),
@@ -611,8 +518,45 @@ class _HomeShellState extends State<HomeShell> {
         setState(() {
           _loading = false;
           _pendingSyncCount = pendingCount;
+          _error ??= widget.api.syncError;
         });
       }
+    }
+  }
+
+  Future<void> _refreshTransactions() {
+    final active = _refreshTask;
+    if (active != null) return active;
+    final task = _performTransactionRefresh();
+    _refreshTask = task;
+    return task.whenComplete(() => _refreshTask = null);
+  }
+
+  Future<void> _performTransactionRefresh() async {
+    try {
+      final results = await Future.wait([
+        widget.api.get("requests"),
+        widget.api.get("borrowings"),
+        widget.api.get("returns"),
+        widget.api.get("payments"),
+      ]);
+      if (!mounted) return;
+      setState(() {
+        _requests = _list(results[0], "requests");
+        _borrowings = _list(results[1], "borrowings");
+        _returns = _list(results[2], "returns");
+        _payments = _list(results[3], "payments");
+        _error = null;
+      });
+    } on ApiException catch (error) {
+      if (mounted) setState(() => _error = error.message);
+    }
+  }
+
+  void _selectTab(int index) {
+    setState(() => _tab = index);
+    if (_admin && const {2, 3, 4}.contains(index)) {
+      unawaited(_refreshTransactions());
     }
   }
 
@@ -676,7 +620,6 @@ class _HomeShellState extends State<HomeShell> {
     });
     try {
       await widget.api.reconnectAndSync(
-        role: widget.user["role"] as String,
         accountId: widget.user["account_id"] as String,
         password: enteredPassword,
       );
@@ -799,6 +742,7 @@ class _HomeShellState extends State<HomeShell> {
         title: Text("Request ${item["name"]}"),
         content: Text(
           "${item["available_stock"]} available • 8-hour borrowing period\n\n"
+          "Borrow requests are accepted daily from 08:00 to 18:59 Philippine time. "
           "Your request must be approved by an administrator before pickup.",
         ),
         actions: [
@@ -941,13 +885,10 @@ class _HomeShellState extends State<HomeShell> {
     String? photoBase64;
     if (photo != null) {
       try {
-        photoBase64 = base64Encode(await File(photo!.path).readAsBytes());
-      } on FileSystemException catch (error) {
+        photoBase64 = base64Encode(await photo!.readAsBytes());
+      } on Exception catch (error) {
         if (mounted) {
-          _showMessage(
-            context,
-            "Could not read the selected photo: ${error.message}",
-          );
+          _showMessage(context, "Could not read the selected photo: $error");
         }
         return;
       }
@@ -1132,6 +1073,7 @@ class _HomeShellState extends State<HomeShell> {
       text: target["program_section"]?.toString() ?? "",
     );
     XFile? selectedPhoto;
+    Uint8List? selectedPhotoBytes;
     String status = target["account_status"]?.toString() ?? "active";
     bool removePhoto = false;
     try {
@@ -1155,8 +1097,8 @@ class _HomeShellState extends State<HomeShell> {
                               radius: 44,
                             )
                           : ClipOval(
-                              child: Image.file(
-                                File(selectedPhoto!.path),
+                              child: Image.memory(
+                                selectedPhotoBytes!,
                                 width: 88,
                                 height: 88,
                                 fit: BoxFit.cover,
@@ -1214,8 +1156,11 @@ class _HomeShellState extends State<HomeShell> {
                                 imageQuality: 78,
                               );
                               if (image != null && dialogContext.mounted) {
+                                final bytes = await image.readAsBytes();
+                                if (!dialogContext.mounted) return;
                                 setDialogState(() {
                                   selectedPhoto = image;
+                                  selectedPhotoBytes = bytes;
                                   removePhoto = false;
                                 });
                               }
@@ -1367,7 +1312,7 @@ class _HomeShellState extends State<HomeShell> {
         if (removePhoto) "remove_profile_photo": true,
       };
       if (selectedPhoto != null) {
-        final photoBytes = await selectedPhoto!.readAsBytes();
+        final photoBytes = selectedPhotoBytes!;
         if (!mounted) return;
         if (photoBytes.length > 1_572_864 || !_isProfileImage(photoBytes)) {
           _showMessage(
@@ -1433,9 +1378,9 @@ class _HomeShellState extends State<HomeShell> {
         } else if (mounted) {
           _showMessage(context, error.message);
         }
-      } on FileSystemException catch (error) {
+      } on Exception catch (error) {
         if (mounted) {
-          _showMessage(context, "Could not read photo: ${error.message}");
+          _showMessage(context, "Could not read photo: $error");
         }
       } finally {
         if (mounted) {
@@ -1802,34 +1747,63 @@ class _HomeShellState extends State<HomeShell> {
                     _adminNavigation(),
                     const SizedBox(height: 14),
                   ],
-                  if (widget.api.isOffline || _pendingSyncCount > 0) ...[
+                  if (widget.api.isWebDemo ||
+                      widget.api.isOffline ||
+                      _pendingSyncCount > 0) ...[
                     Card(
                       child: Padding(
                         padding: const EdgeInsets.all(14),
                         child: Row(
                           children: [
-                            const Icon(Icons.cloud_off_outlined, color: _blue),
+                            Icon(
+                              widget.api.isWebDemo
+                                  ? Icons.storage_outlined
+                                  : Icons.cloud_off_outlined,
+                              color: _blue,
+                            ),
                             const SizedBox(width: 10),
                             Expanded(
                               child: Text(
-                                widget.api.isOffline
+                                widget.api.isWebDemo
+                                    ? "Browser offline mode • saved locally; not connected to MySQL."
+                                    : widget.api.isOffline
                                     ? "$_pendingSyncCount changes waiting to sync. Saved on this device."
                                     : "$_pendingSyncCount changes still need MySQL sync.",
                                 style: TextStyle(fontWeight: FontWeight.w600),
                               ),
                             ),
-                            const SizedBox(width: 8),
-                            TextButton(
-                              onPressed: _syncOfflineChanges,
-                              child: const Text("Sync"),
-                            ),
+                            if (!widget.api.isWebDemo) ...[
+                              const SizedBox(width: 8),
+                              TextButton(
+                                onPressed: _syncOfflineChanges,
+                                child: const Text("Sync"),
+                              ),
+                            ],
                           ],
                         ),
                       ),
                     ),
                     const SizedBox(height: 10),
                   ],
-                  if (_admin) _adminPage() else _studentPage(),
+                  AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 220),
+                    switchInCurve: Curves.easeOutCubic,
+                    switchOutCurve: Curves.easeInCubic,
+                    transitionBuilder: (child, animation) => FadeTransition(
+                      opacity: animation,
+                      child: SlideTransition(
+                        position: Tween<Offset>(
+                          begin: const Offset(0, 0.025),
+                          end: Offset.zero,
+                        ).animate(animation),
+                        child: child,
+                      ),
+                    ),
+                    child: KeyedSubtree(
+                      key: ValueKey("${_admin ? "admin" : "student"}-$_tab"),
+                      child: _admin ? _adminPage() : _studentPage(),
+                    ),
+                  ),
                 ],
               ),
             ),
@@ -1894,7 +1868,7 @@ class _HomeShellState extends State<HomeShell> {
             avatar: Icon(icon, size: 18),
             label: Text(label),
             selected: _tab == index,
-            onSelected: (_) => setState(() => _tab = index),
+            onSelected: (_) => _selectTab(index),
           );
         },
       ),
@@ -2065,6 +2039,7 @@ class _HomeShellState extends State<HomeShell> {
     hasMore: _equipmentHasMore,
     categories: _equipmentCategories,
     offline: widget.api.isOffline,
+    isWebDemo: widget.api.isWebDemo,
     updating: _loading,
     isAdmin: false,
     loadPage:
@@ -2579,6 +2554,7 @@ class _HomeShellState extends State<HomeShell> {
     hasMore: _equipmentHasMore,
     categories: _equipmentCategories,
     offline: widget.api.isOffline,
+    isWebDemo: widget.api.isWebDemo,
     updating: _loading,
     isAdmin: true,
     loadPage:
@@ -2701,20 +2677,23 @@ class _HomeShellState extends State<HomeShell> {
     leading: _EquipmentThumb(asset: row["image_asset"] as String?),
     title: row["item_name"] as String? ?? "Equipment request",
     subtitle:
-        "${row["request_code"]} • ${row["student_name"]} (${row["account_id"]})",
+        "${row["request_code"]} • ${row["student_name"]} (${row["account_id"]})"
+        "${row["_sync_pending"] == true ? "\nWaiting for student sync before review" : ""}",
     trailing: _StatusTag(status: row["status"] as String? ?? "pending"),
     footer: Row(
       children: [
         Expanded(
           child: OutlinedButton.icon(
-            onPressed: () => _adminAction(
-              "review_request",
-              idKey: "request_id",
-              id: row["id"],
-              decision: "rejected",
-              referenceKey: "request_code",
-              reference: row["request_code"],
-            ),
+            onPressed: row["_sync_pending"] == true
+                ? null
+                : () => _adminAction(
+                    "review_request",
+                    idKey: "request_id",
+                    id: row["id"],
+                    decision: "rejected",
+                    referenceKey: "request_code",
+                    reference: row["request_code"],
+                  ),
             icon: const Icon(Icons.close, size: 18),
             label: const Text("Reject"),
           ),
@@ -2722,14 +2701,16 @@ class _HomeShellState extends State<HomeShell> {
         const SizedBox(width: 9),
         Expanded(
           child: FilledButton.icon(
-            onPressed: () => _adminAction(
-              "review_request",
-              idKey: "request_id",
-              id: row["id"],
-              decision: "approved",
-              referenceKey: "request_code",
-              reference: row["request_code"],
-            ),
+            onPressed: row["_sync_pending"] == true
+                ? null
+                : () => _adminAction(
+                    "review_request",
+                    idKey: "request_id",
+                    id: row["id"],
+                    decision: "approved",
+                    referenceKey: "request_code",
+                    reference: row["request_code"],
+                  ),
             icon: const Icon(Icons.check, size: 18),
             label: const Text("Approve"),
           ),
@@ -2761,7 +2742,8 @@ class _HomeShellState extends State<HomeShell> {
               leading: const Icon(Icons.assignment_return_outlined),
               title: row["item_name"] as String,
               subtitle:
-                  "${row["student_name"]} • Reported ${row["reported_condition"]} • ${row["transaction_code"]}",
+                  "${row["student_name"]} • Reported ${row["reported_condition"]} • ${row["transaction_code"]}"
+                  "${row["_sync_pending"] == true ? "\nWaiting for student sync before review" : ""}",
               trailing: _StatusTag(
                 status: (row["reported_condition"] as String).toLowerCase(),
               ),
@@ -2775,28 +2757,32 @@ class _HomeShellState extends State<HomeShell> {
                     ),
                   Expanded(
                     child: OutlinedButton(
-                      onPressed: () => _adminAction(
-                        "review_return",
-                        idKey: "report_id",
-                        id: row["id"],
-                        decision: "reject",
-                        referenceKey: "request_code",
-                        reference: row["request_code"],
-                      ),
+                      onPressed: row["_sync_pending"] == true
+                          ? null
+                          : () => _adminAction(
+                              "review_return",
+                              idKey: "report_id",
+                              id: row["id"],
+                              decision: "reject",
+                              referenceKey: "request_code",
+                              reference: row["request_code"],
+                            ),
                       child: const Text("Ask to resubmit"),
                     ),
                   ),
                   const SizedBox(width: 9),
                   Expanded(
                     child: FilledButton(
-                      onPressed: () => _adminAction(
-                        "review_return",
-                        idKey: "report_id",
-                        id: row["id"],
-                        decision: "accept",
-                        referenceKey: "request_code",
-                        reference: row["request_code"],
-                      ),
+                      onPressed: row["_sync_pending"] == true
+                          ? null
+                          : () => _adminAction(
+                              "review_return",
+                              idKey: "report_id",
+                              id: row["id"],
+                              decision: "accept",
+                              referenceKey: "request_code",
+                              reference: row["request_code"],
+                            ),
                       child: const Text("Verify return"),
                     ),
                   ),
@@ -2842,7 +2828,8 @@ class _HomeShellState extends State<HomeShell> {
             leading: const Icon(Icons.payments_outlined),
             title: "${row["student_name"]} • ${_peso(_number(row["amount"]))}",
             subtitle:
-                "${row["method"]} • ${row["payment_code"]} • ${row["reference_note"] ?? "No reference"}",
+                "${row["method"]} • ${row["payment_code"]} • ${row["reference_note"] ?? "No reference"}"
+                "${row["_sync_pending"] == true ? "\nWaiting for student sync before review" : ""}",
             trailing: _StatusTag(status: row["status"] as String),
             footer: row["status"] != "pending"
                 ? null
@@ -2850,28 +2837,32 @@ class _HomeShellState extends State<HomeShell> {
                     children: [
                       Expanded(
                         child: OutlinedButton(
-                          onPressed: () => _adminAction(
-                            "review_payment",
-                            idKey: "payment_id",
-                            id: row["id"],
-                            decision: "reject",
-                            referenceKey: "payment_code",
-                            reference: row["payment_code"],
-                          ),
+                          onPressed: row["_sync_pending"] == true
+                              ? null
+                              : () => _adminAction(
+                                  "review_payment",
+                                  idKey: "payment_id",
+                                  id: row["id"],
+                                  decision: "reject",
+                                  referenceKey: "payment_code",
+                                  reference: row["payment_code"],
+                                ),
                           child: const Text("Reject"),
                         ),
                       ),
                       const SizedBox(width: 9),
                       Expanded(
                         child: FilledButton(
-                          onPressed: () => _adminAction(
-                            "review_payment",
-                            idKey: "payment_id",
-                            id: row["id"],
-                            decision: "verify",
-                            referenceKey: "payment_code",
-                            reference: row["payment_code"],
-                          ),
+                          onPressed: row["_sync_pending"] == true
+                              ? null
+                              : () => _adminAction(
+                                  "review_payment",
+                                  idKey: "payment_id",
+                                  id: row["id"],
+                                  decision: "verify",
+                                  referenceKey: "payment_code",
+                                  reference: row["payment_code"],
+                                ),
                           child: const Text("Verify"),
                         ),
                       ),
@@ -3433,12 +3424,16 @@ class _SettingsPageState extends State<_SettingsPage> {
                     widget.offline ? Icons.cloud_off_outlined : Icons.sync,
                   ),
                   title: Text(
-                    widget.offline
+                    widget.api.isWebDemo
+                        ? "Browser offline mode — saved in this browser"
+                        : widget.offline
                         ? "Offline — saved on this device"
                         : "${widget.pendingSyncCount} changes waiting to sync",
                   ),
                   subtitle: Text(
-                    widget.offline
+                    widget.api.isWebDemo
+                        ? "This mode uses browser storage only; it does not connect to XAMPP or MySQL."
+                        : widget.offline
                         ? "Reconnect to the server to synchronize queued changes."
                         : "Queued changes are retained until synchronization succeeds.",
                   ),
@@ -3470,6 +3465,7 @@ class _InventoryView extends StatefulWidget {
     required this.hasMore,
     required this.categories,
     required this.offline,
+    required this.isWebDemo,
     required this.updating,
     required this.isAdmin,
     required this.loadPage,
@@ -3483,6 +3479,7 @@ class _InventoryView extends StatefulWidget {
   final bool hasMore;
   final List<String> categories;
   final bool offline;
+  final bool isWebDemo;
   final bool updating;
   final bool isAdmin;
   final Future<JsonMap> Function({
@@ -3677,8 +3674,10 @@ class _InventoryViewState extends State<_InventoryView> {
         ),
         const SizedBox(height: 12),
         if (_offline)
-          const _MessageBanner(
-            message: "Offline — showing locally synchronized inventory.",
+          _MessageBanner(
+            message: widget.isWebDemo
+                ? "Browser offline mode • local inventory; not connected to MySQL."
+                : "Offline — showing locally synchronized inventory.",
             isError: false,
           )
         else

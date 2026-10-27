@@ -1,0 +1,45 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Flutter: pub get",
+      "type": "process",
+      "command": "flutter",
+      "args": ["pub", "get"],
+      "options": {
+        "cwd": "${workspaceFolder}\\mobile"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Flutter: analyze",
+      "type": "process",
+      "command": "flutter",
+      "args": ["analyze"],
+      "options": {
+        "cwd": "${workspaceFolder}\\mobile"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Flutter: test",
+      "type": "process",
+      "command": "flutter",
+      "args": ["test"],
+      "options": {
+        "cwd": "${workspaceFolder}\\mobile"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Flutter: run",
+      "type": "process",
+      "command": "flutter",
+      "args": ["run"],
+      "options": {
+        "cwd": "${workspaceFolder}\\mobile"
+      },
+      "problemMatcher": []
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+{
+  "dart.projectSearchDepth": 2,
+  "terminal.integrated.cwd": "${workspaceFolder}\\mobile"
+}

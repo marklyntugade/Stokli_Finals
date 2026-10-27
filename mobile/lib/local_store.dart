@@ -8,6 +8,14 @@ import "api_exception.dart";
 
 typedef JsonMap = Map<String, dynamic>;
 
+bool borrowingWindowOpen([DateTime? now]) {
+  final manilaTime = (now ?? DateTime.now()).toUtc().add(
+    const Duration(hours: 8),
+  );
+  final minuteOfDay = manilaTime.hour * 60 + manilaTime.minute;
+  return minuteOfDay >= 8 * 60 && minuteOfDay < 19 * 60;
+}
+
 const _items = [
   {
     "code": "STK-001",
@@ -68,10 +76,12 @@ const _items = [
 ];
 
 class LocalStore {
-  LocalStore({Database? database}) {
+  LocalStore({Database? database, DateTime Function()? clock})
+    : _clock = clock ?? DateTime.now {
     _database = database;
   }
 
+  final DateTime Function() _clock;
   Database? _database;
   Future<Database>? _opening;
 
@@ -85,10 +95,9 @@ class LocalStore {
     final root = await getDatabasesPath();
     return openDatabase(
       "$root/stokli_local.db",
-      version: 4,
+      version: 5,
       onCreate: (db, version) async {
         await _createSchema(db);
-        await _seed(db);
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) await _createSyncTables(db);
@@ -105,6 +114,7 @@ class LocalStore {
           await _createEquipmentIndexes(db);
         }
         if (oldVersion < 4) await _ensureAccountColumns(db);
+        if (oldVersion < 5) await _removeLegacyDemoAccounts(db);
       },
     );
   }
@@ -113,7 +123,7 @@ class LocalStore {
     await _createSchema(db);
   }
 
-  static Future<void> seed(DatabaseExecutor db) async {
+  static Future<void> seedEquipment(DatabaseExecutor db) async {
     await _seed(db);
   }
 
@@ -275,6 +285,110 @@ class LocalStore {
     }
   }
 
+  static Future<void> _removeLegacyDemoAccounts(DatabaseExecutor db) async {
+    const accountIds = [
+      "STUDENT-001",
+      "STUDENT-002",
+      "STUDENT-003",
+      "STUDENT-004",
+      "STUDENT-005",
+      "STUDENT-006",
+      "ADMIN-001",
+      "ADMIN-002",
+    ];
+    final users = await db.query(
+      "users",
+      columns: ["id"],
+      where: "account_id IN (${List.filled(accountIds.length, "?").join(",")})",
+      whereArgs: accountIds,
+    );
+    if (users.isEmpty) return;
+
+    final userIds = users.map((row) => row["id"] as int).toList();
+    final userPlaceholders = List.filled(userIds.length, "?").join(",");
+    final requests = await db.rawQuery(
+      "SELECT id FROM borrowing_requests WHERE user_id IN ($userPlaceholders)",
+      userIds,
+    );
+    final requestIds = requests.map((row) => row["id"] as int).toList();
+    final requestPlaceholders = List.filled(requestIds.length, "?").join(",");
+    final transactions = await db.rawQuery(
+      "SELECT id FROM borrowing_transactions WHERE user_id IN ($userPlaceholders)"
+      "${requestIds.isEmpty ? "" : " OR request_id IN ($requestPlaceholders)"}",
+      [...userIds, ...requestIds],
+    );
+    final transactionIds = transactions.map((row) => row["id"] as int).toList();
+    final transactionPlaceholders = List.filled(
+      transactionIds.length,
+      "?",
+    ).join(",");
+
+    if (userIds.isNotEmpty) {
+      await db.delete(
+        "payments",
+        where: "user_id IN ($userPlaceholders)",
+        whereArgs: userIds,
+      );
+      await db.delete(
+        "inventory_exceptions",
+        where: "reported_by IN ($userPlaceholders)",
+        whereArgs: userIds,
+      );
+      await db.delete(
+        "system_logs",
+        where: "actor_id IN ($userPlaceholders)",
+        whereArgs: userIds,
+      );
+    }
+    if (userIds.isNotEmpty || transactionIds.isNotEmpty) {
+      await db.delete(
+        "return_reports",
+        where: [
+          if (userIds.isNotEmpty) "user_id IN ($userPlaceholders)",
+          if (transactionIds.isNotEmpty)
+            "transaction_id IN ($transactionPlaceholders)",
+        ].join(" OR "),
+        whereArgs: [...userIds, ...transactionIds],
+      );
+      await db.delete(
+        "penalties",
+        where: [
+          if (userIds.isNotEmpty) "user_id IN ($userPlaceholders)",
+          if (transactionIds.isNotEmpty)
+            "transaction_id IN ($transactionPlaceholders)",
+        ].join(" OR "),
+        whereArgs: [...userIds, ...transactionIds],
+      );
+    }
+    if (transactionIds.isNotEmpty) {
+      await db.delete(
+        "borrowing_transactions",
+        where: "id IN ($transactionPlaceholders)",
+        whereArgs: transactionIds,
+      );
+    }
+    await db.delete(
+      "borrowing_requests",
+      where: "user_id IN ($userPlaceholders)",
+      whereArgs: userIds,
+    );
+    await db.delete(
+      "offline_outbox",
+      where: "account_id IN (${List.filled(accountIds.length, "?").join(",")})",
+      whereArgs: accountIds,
+    );
+    await db.delete(
+      "remote_snapshots",
+      where: "account_id IN (${List.filled(accountIds.length, "?").join(",")})",
+      whereArgs: accountIds,
+    );
+    await db.delete(
+      "users",
+      where: "id IN ($userPlaceholders)",
+      whereArgs: userIds,
+    );
+  }
+
   static Future<void> _createEquipmentIndexes(DatabaseExecutor db) async {
     await db.execute(
       "CREATE INDEX IF NOT EXISTS idx_local_equipment_name ON equipment(name)",
@@ -315,28 +429,6 @@ class LocalStore {
   }
 
   static Future<void> _seed(DatabaseExecutor db) async {
-    final passwordHash = _hash("demo-student");
-    final adminHash = _hash("demo-admin");
-    final users = [
-      ["STUDENT-001", "Demo Student 1", passwordHash, "student"],
-      ["STUDENT-002", "Demo Student 2", passwordHash, "student"],
-      ["STUDENT-003", "Demo Student 3", passwordHash, "student"],
-      ["STUDENT-004", "Demo Student 4", passwordHash, "student"],
-      ["STUDENT-005", "Demo Student 5", passwordHash, "student"],
-      ["STUDENT-006", "Demo Student 6", passwordHash, "student"],
-      ["ADMIN-001", "Demo Admin 1", adminHash, "admin"],
-      ["ADMIN-002", "Demo Admin 2", adminHash, "admin"],
-    ];
-    for (final user in users) {
-      await db.insert("users", {
-        "account_id": user[0],
-        "full_name": user[1],
-        "password_hash": user[2],
-        "role": user[3],
-        "program_section": user[3] == "student" ? "BSIT 204" : null,
-      }, conflictAlgorithm: ConflictAlgorithm.ignore);
-    }
-
     for (var i = 0; i < _items.length; i++) {
       final item = _items[i];
       await db.insert("equipment", {
@@ -351,98 +443,6 @@ class LocalStore {
         "image_asset": item["image"],
       }, conflictAlgorithm: ConflictAlgorithm.ignore);
     }
-
-    final now = DateTime.now();
-    final usersByAccount = await db.query("users");
-    final userIds = {
-      for (final row in usersByAccount)
-        row["account_id"] as String: row["id"] as int,
-    };
-    await db.insert("borrowing_requests", {
-      "id": 1,
-      "request_code": "REQ-2026-0051",
-      "user_id": userIds["STUDENT-001"],
-      "equipment_id": 3,
-      "status": "pending",
-      "requested_at": now
-          .subtract(const Duration(minutes: 30))
-          .toIso8601String(),
-    }, conflictAlgorithm: ConflictAlgorithm.ignore);
-    await db.insert("borrowing_requests", {
-      "id": 2,
-      "request_code": "REQ-2026-0052",
-      "user_id": userIds["STUDENT-004"],
-      "equipment_id": 7,
-      "status": "pending",
-      "requested_at": now
-          .subtract(const Duration(minutes: 20))
-          .toIso8601String(),
-    }, conflictAlgorithm: ConflictAlgorithm.ignore);
-    await db.insert("borrowing_requests", {
-      "id": 3,
-      "request_code": "REQ-2026-0053",
-      "user_id": userIds["STUDENT-005"],
-      "equipment_id": 8,
-      "status": "pending",
-      "requested_at": now
-          .subtract(const Duration(minutes: 10))
-          .toIso8601String(),
-    }, conflictAlgorithm: ConflictAlgorithm.ignore);
-    await db.insert("borrowing_requests", {
-      "id": 4,
-      "request_code": "REQ-2026-0048",
-      "user_id": userIds["STUDENT-001"],
-      "equipment_id": 1,
-      "status": "approved",
-      "requested_at": now.subtract(const Duration(hours: 2)).toIso8601String(),
-      "reviewed_at": now.subtract(const Duration(hours: 1)).toIso8601String(),
-    }, conflictAlgorithm: ConflictAlgorithm.ignore);
-    await db.insert("borrowing_transactions", {
-      "id": 1,
-      "transaction_code": "BOR-2026-000001",
-      "request_id": 4,
-      "user_id": userIds["STUDENT-001"],
-      "equipment_id": 1,
-      "borrowed_at": now.subtract(const Duration(hours: 2)).toIso8601String(),
-      "due_at": now.add(const Duration(hours: 6)).toIso8601String(),
-      "status": "active",
-    }, conflictAlgorithm: ConflictAlgorithm.ignore);
-    await db.insert("penalties", {
-      "id": 1,
-      "user_id": userIds["STUDENT-001"],
-      "amount": 200,
-      "amount_paid": 0,
-      "reason": "Outstanding equipment penalty",
-      "status": "unpaid",
-      "created_at": now.toIso8601String(),
-    }, conflictAlgorithm: ConflictAlgorithm.ignore);
-    await db.insert("inventory_exceptions", {
-      "id": 1,
-      "equipment_id": 4,
-      "reported_by": userIds["ADMIN-001"],
-      "exception_type": "damaged",
-      "quantity": 1,
-      "notes": "Speaker is under staff review.",
-      "status": "open",
-      "created_at": now.toIso8601String(),
-    }, conflictAlgorithm: ConflictAlgorithm.ignore);
-    await db.insert("inventory_exceptions", {
-      "id": 2,
-      "equipment_id": 8,
-      "reported_by": userIds["ADMIN-001"],
-      "exception_type": "missing",
-      "quantity": 1,
-      "notes": "Reported missing during stock check.",
-      "status": "open",
-      "created_at": now.toIso8601String(),
-    }, conflictAlgorithm: ConflictAlgorithm.ignore);
-    await db.insert("system_logs", {
-      "actor_id": userIds["ADMIN-001"],
-      "action": "system.seeded",
-      "entity_type": "database",
-      "details": "Offline Stokli sample records created.",
-      "created_at": now.toIso8601String(),
-    }, conflictAlgorithm: ConflictAlgorithm.ignore);
   }
 
   static String _hash(String password) =>
@@ -457,7 +457,6 @@ class LocalStore {
     final db = await _db;
     final accountId = (body["account_id"] as String? ?? "").trim();
     final password = body["password"] as String? ?? "";
-    final role = body["role"] as String? ?? "";
     final rows = await db.query(
       "users",
       where: "lower(account_id) = lower(?)",
@@ -465,11 +464,10 @@ class LocalStore {
       limit: 1,
     );
     if (rows.isEmpty ||
-        rows.first["role"] != role ||
         rows.first["account_status"] != "active" ||
         rows.first["password_hash"] != _hash(password)) {
       throw const ApiException(
-        "Invalid account ID, account type, or password.",
+        "Invalid account ID or password.",
         statusCode: 401,
       );
     }
@@ -1102,11 +1100,20 @@ class LocalStore {
     if (remoteRows is! List || localRows is! List) {
       return {...decoded, ...local};
     }
+    final includeOtherAccounts =
+        user["role"] == "admin" &&
+        const {"requests", "returns", "payments"}.contains(action);
+    final pendingActions = switch (action) {
+      "requests" => "action IN ('create_request', 'review_request')",
+      "returns" => "action IN ('create_return', 'review_return')",
+      "payments" => "action IN ('create_payment', 'review_payment')",
+      _ => null,
+    };
     final pending = await (await _db).query(
       "offline_outbox",
       columns: ["action", "payload"],
-      where: "account_id=?",
-      whereArgs: [accountId],
+      where: includeOtherAccounts ? pendingActions : "account_id=?",
+      whereArgs: includeOtherAccounts ? null : [accountId],
     );
     final pendingKeys = <String>{};
     for (final operation in pending) {
@@ -1183,12 +1190,12 @@ class LocalStore {
         "borrowings" => value["request_code"],
         "payments" => value["payment_code"],
         "exceptions" => value["equipment_code"],
-        "returns" => value["transaction_code"],
+        "returns" => value["request_code"],
         "penalties" => "__penalties__",
         _ => key,
       };
       if (key != null && pendingKeys.contains(syncKey)) {
-        merged[key] = value;
+        merged[key] = {...value, "_sync_pending": true};
       }
     }
     return {...decoded, ...local, listKey: merged.values.toList()};
@@ -1542,7 +1549,12 @@ class LocalStore {
 
   Future<JsonMap> post(String action, JsonMap body, String token) async {
     if (action == "login") return login(body);
-    if (action == "register") return register(body);
+    if (action == "register") {
+      throw const ApiException(
+        "Self-service account registration is disabled. Contact an administrator.",
+        statusCode: 403,
+      );
+    }
     final user = await _userForToken(token);
     final db = await _db;
     switch (action) {
@@ -1597,50 +1609,6 @@ class LocalStore {
           statusCode: 404,
         );
     }
-  }
-
-  Future<JsonMap> register(JsonMap body) async {
-    final db = await _db;
-    final accountId = (body["account_id"] as String? ?? "").trim();
-    final fullName = (body["full_name"] as String? ?? "").trim();
-    final password = body["password"] as String? ?? "";
-    if (accountId.isEmpty || fullName.isEmpty || !_strongPassword(password)) {
-      throw const ApiException(
-        "Enter an account ID, full name, and a strong password.",
-        statusCode: 422,
-      );
-    }
-    try {
-      await db.insert("users", {
-        "account_id": accountId,
-        "full_name": fullName,
-        "password_hash": _hash(password),
-        "role": "student",
-        "program_section": "",
-      });
-    } on DatabaseException {
-      throw const ApiException(
-        "That account ID is already registered.",
-        statusCode: 409,
-      );
-    }
-    await _log(null, "auth.register", "user", null, detail: accountId);
-    return {"message": "Account created. You can now sign in."};
-  }
-
-  Future<void> cacheRegisteredUser({
-    required String accountId,
-    required String fullName,
-    required String password,
-  }) async {
-    final db = await _db;
-    await db.insert("users", {
-      "account_id": accountId,
-      "full_name": fullName,
-      "password_hash": _hash(password),
-      "role": "student",
-      "program_section": "",
-    }, conflictAlgorithm: ConflictAlgorithm.ignore);
   }
 
   Future<JsonMap> changePassword(JsonMap user, JsonMap body) async {
@@ -1881,6 +1849,12 @@ class LocalStore {
         statusCode: 403,
       );
     }
+    if (!borrowingWindowOpen(_clock())) {
+      throw const ApiException(
+        "New borrowing requests are available daily from 08:00 to 18:59 Philippine time.",
+        statusCode: 403,
+      );
+    }
     final db = await _db;
     final code = body["equipment_code"] as String? ?? "";
     return db.transaction((txn) async {
@@ -2107,7 +2081,7 @@ class LocalStore {
         txn: txn,
       );
       return {
-        "message": "Return report sent for staff review.",
+        "message": "Return report sent for admin review.",
         "report_id": reportId,
       };
     });

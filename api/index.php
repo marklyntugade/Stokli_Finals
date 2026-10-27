@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+require_once __DIR__ . '/business_rules.php';
+
 final class ApiError extends RuntimeException
 {
     public int $httpStatus;
@@ -214,6 +216,133 @@ function ensure_account_schema(PDO $db): void
     $db->exec('INSERT IGNORE INTO api_schema_migrations (version) VALUES (2)');
 }
 
+function ensure_demo_accounts_removed(PDO $db): void
+{
+    $applied = $db->query(
+        'SELECT 1 FROM api_schema_migrations WHERE version = 3 LIMIT 1'
+    )->fetchColumn();
+    if ($applied) {
+        return;
+    }
+
+    $accountIds = [
+        'STUDENT-001',
+        'STUDENT-002',
+        'STUDENT-003',
+        'STUDENT-004',
+        'STUDENT-005',
+        'STUDENT-006',
+        'ADMIN-001',
+        'ADMIN-002',
+    ];
+    $accountPlaceholders = implode(',', array_fill(0, count($accountIds), '?'));
+    $db->beginTransaction();
+    try {
+        $statement = $db->prepare(
+            "SELECT id FROM users WHERE account_id IN ({$accountPlaceholders})"
+        );
+        $statement->execute($accountIds);
+        $userIds = array_map('intval', $statement->fetchAll(PDO::FETCH_COLUMN));
+        if ($userIds !== []) {
+            $userPlaceholders = implode(',', array_fill(0, count($userIds), '?'));
+            $requestStatement = $db->prepare(
+                "SELECT id FROM borrowing_requests WHERE user_id IN ({$userPlaceholders})"
+            );
+            $requestStatement->execute($userIds);
+            $requestIds = array_map(
+                'intval',
+                $requestStatement->fetchAll(PDO::FETCH_COLUMN)
+            );
+
+            $transactionCondition = "user_id IN ({$userPlaceholders})";
+            $transactionParams = $userIds;
+            if ($requestIds !== []) {
+                $requestPlaceholders = implode(',', array_fill(0, count($requestIds), '?'));
+                $transactionCondition .= " OR request_id IN ({$requestPlaceholders})";
+                array_push($transactionParams, ...$requestIds);
+            }
+            $transactionStatement = $db->prepare(
+                "SELECT id FROM borrowing_transactions WHERE {$transactionCondition}"
+            );
+            $transactionStatement->execute($transactionParams);
+            $transactionIds = array_map(
+                'intval',
+                $transactionStatement->fetchAll(PDO::FETCH_COLUMN)
+            );
+
+            $deleteByUsers = static function (string $table, string $column) use (
+                $db,
+                $userPlaceholders,
+                $userIds
+            ): void {
+                $statement = $db->prepare(
+                    "DELETE FROM {$table} WHERE {$column} IN ({$userPlaceholders})"
+                );
+                $statement->execute($userIds);
+            };
+            $deleteByUsers('payments', 'user_id');
+            $deleteByUsers('inventory_exceptions', 'reported_by');
+
+            if ($transactionIds !== []) {
+                $transactionPlaceholders = implode(
+                    ',',
+                    array_fill(0, count($transactionIds), '?')
+                );
+                $statement = $db->prepare(
+                    "DELETE FROM return_reports WHERE user_id IN ({$userPlaceholders})
+                     OR transaction_id IN ({$transactionPlaceholders})"
+                );
+                $statement->execute([...$userIds, ...$transactionIds]);
+                $statement = $db->prepare(
+                    "DELETE FROM penalties WHERE user_id IN ({$userPlaceholders})
+                     OR transaction_id IN ({$transactionPlaceholders})"
+                );
+                $statement->execute([...$userIds, ...$transactionIds]);
+                $statement = $db->prepare(
+                    "DELETE FROM borrowing_transactions WHERE id IN ({$transactionPlaceholders})"
+                );
+                $statement->execute($transactionIds);
+            } else {
+                $deleteByUsers('return_reports', 'user_id');
+                $deleteByUsers('penalties', 'user_id');
+            }
+
+            foreach ([
+                'payments' => 'reviewed_by',
+                'return_reports' => 'reviewed_by',
+                'borrowing_requests' => 'reviewed_by',
+            ] as $table => $column) {
+                $statement = $db->prepare(
+                    "UPDATE {$table} SET {$column} = NULL
+                     WHERE {$column} IN ({$userPlaceholders})"
+                );
+                $statement->execute($userIds);
+            }
+            $statement = $db->prepare(
+                "DELETE FROM borrowing_requests WHERE user_id IN ({$userPlaceholders})"
+            );
+            $statement->execute($userIds);
+            $statement = $db->prepare(
+                "UPDATE system_logs SET actor_id = NULL
+                 WHERE actor_id IN ({$userPlaceholders})"
+            );
+            $statement->execute($userIds);
+            $statement = $db->prepare(
+                "DELETE FROM users WHERE id IN ({$userPlaceholders})"
+            );
+            $statement->execute($userIds);
+        }
+
+        $db->exec('INSERT IGNORE INTO api_schema_migrations (version) VALUES (3)');
+        $db->commit();
+    } catch (Throwable $error) {
+        if ($db->inTransaction()) {
+            $db->rollBack();
+        }
+        throw $error;
+    }
+}
+
 function equipment_query(PDO $db, array $filters = []): array
 {
     $search = trim((string)($filters['search'] ?? ''));
@@ -343,7 +472,11 @@ function unpaid_balance(PDO $db, int $userId): float
     return (float)$statement->fetchColumn();
 }
 
-header('Access-Control-Allow-Origin: *');
+$origin = (string)($_SERVER['HTTP_ORIGIN'] ?? '');
+if (preg_match('#^https?://(localhost|127\.0\.0\.1)(:\d+)?$#i', $origin)) {
+    header('Access-Control-Allow-Origin: ' . $origin);
+    header('Vary: Origin');
+}
 header('Access-Control-Allow-Methods: GET, POST, PATCH, OPTIONS');
 header('Access-Control-Allow-Headers: Authorization, Content-Type, Idempotency-Key');
 header('Cache-Control: no-store');
@@ -365,6 +498,7 @@ try {
             PDO::ATTR_EMULATE_PREPARES => false,
         ]
     );
+    $db->exec("SET time_zone = '+08:00'");
     $db->exec(
         'CREATE TABLE IF NOT EXISTS api_idempotency (
            user_id BIGINT UNSIGNED NOT NULL,
@@ -380,6 +514,7 @@ try {
     );
     ensure_equipment_schema($db);
     ensure_account_schema($db);
+    ensure_demo_accounts_removed($db);
 } catch (PDOException $error) {
     error_log('Stokli database connection failed: ' . $error->getMessage());
     respond(['error' => 'The Stokli database is unavailable. Check the XAMPP MySQL service and database setup.'], 503);
@@ -401,16 +536,17 @@ try {
     if ($action === 'login' && $method === 'POST') {
         $accountId = require_value($body['account_id'] ?? null, 'account ID');
         $password = require_value($body['password'] ?? null, 'password');
-        $role = $body['role'] ?? null;
-        if (!in_array($role, ['student', 'admin'], true)) {
-            throw new ApiError('Choose a valid account type.', 422);
-        }
 
-        $statement = $db->prepare('SELECT * FROM users WHERE account_id = ? LIMIT 1');
+        $statement = $db->prepare(
+            'SELECT id, account_id, full_name, password_hash, role, email, program_section,
+                    contact_number, account_status, profile_photo, profile_version,
+                    created_at, updated_at
+             FROM users WHERE account_id = ? LIMIT 1'
+        );
         $statement->execute([$accountId]);
         $user = $statement->fetch();
-        if (!$user || $user['role'] !== $role || !password_verify($password, $user['password_hash'])) {
-            throw new ApiError('Invalid account ID, account type, or password.', 401);
+        if (!$user || !password_verify($password, $user['password_hash'])) {
+            throw new ApiError('Invalid account ID or password.', 401);
         }
         if ($user['account_status'] !== 'active') {
             throw new ApiError('This account has been suspended. Contact an administrator.', 403);
@@ -426,27 +562,7 @@ try {
     }
 
     if ($action === 'register' && $method === 'POST') {
-        $accountId = require_value($body['account_id'] ?? null, 'student ID');
-        $fullName = require_value($body['full_name'] ?? null, 'full name');
-        $password = require_value($body['password'] ?? null, 'password');
-        if (strlen($password) < 8 || !preg_match('/[A-Z]/', $password) || !preg_match('/[a-z]/', $password)
-            || !preg_match('/\d/', $password) || !preg_match('/[^A-Za-z0-9]/', $password)) {
-            throw new ApiError('Use at least 8 characters with uppercase, lowercase, a number, and a special character.', 422);
-        }
-
-        $statement = $db->prepare('SELECT id FROM users WHERE account_id = ? LIMIT 1');
-        $statement->execute([$accountId]);
-        if ($statement->fetchColumn()) {
-            throw new ApiError('That account ID is already registered.', 409);
-        }
-
-        $insert = $db->prepare(
-            'INSERT INTO users (account_id, full_name, password_hash, role) VALUES (?, ?, ?, "student")'
-        );
-        $insert->execute([$accountId, $fullName, password_hash($password, PASSWORD_DEFAULT)]);
-        $userId = (int)$db->lastInsertId();
-        log_action($db, $userId, 'auth.register', 'user', $userId);
-        respond(['message' => 'Account created. You can now sign in.'], 201);
+        throw new ApiError('Self-service account registration is disabled. Contact an administrator.', 403);
     }
 
     $user = current_user($db);
@@ -843,6 +959,12 @@ try {
         if ($user['role'] !== 'student') {
             throw new ApiError('Only student accounts can request equipment.', 403);
         }
+        if (!borrowing_window_open()) {
+            throw new ApiError(
+                'New borrowing requests are available daily from 08:00 to 18:59 Philippine time.',
+                403
+            );
+        }
         $code = require_value($body['equipment_code'] ?? null, 'equipment code');
         $db->beginTransaction();
         $equipmentQuery = $db->prepare(
@@ -1020,7 +1142,7 @@ try {
         $update->execute([$transactionId]);
         log_action($db, $userId, 'return.submitted', 'return_report', $reportId, $condition);
         $db->commit();
-        respond(['message' => 'Return report sent for staff review.'], 201);
+        respond(['message' => 'Return report sent for admin review.'], 201);
     }
 
     if ($action === 'returns' && $method === 'GET') {

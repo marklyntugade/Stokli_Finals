@@ -1,6 +1,7 @@
 import "dart:convert";
 import "dart:io";
 
+import "package:crypto/crypto.dart";
 import "package:flutter_test/flutter_test.dart";
 import "package:sqflite_common_ffi/sqflite_ffi.dart";
 import "package:stokli_mobile/api_exception.dart";
@@ -22,8 +23,12 @@ void main() {
       "${tempDirectory.path}\\stokli_test.db",
     );
     await LocalStore.createSchema(database);
-    await LocalStore.seed(database);
-    store = LocalStore(database: database);
+    await LocalStore.seedEquipment(database);
+    await _seedTestUsers(database);
+    store = LocalStore(
+      database: database,
+      clock: () => DateTime.utc(2026, 1, 1, 4),
+    );
   });
 
   tearDown(() async {
@@ -31,41 +36,40 @@ void main() {
     await tempDirectory.delete(recursive: true);
   });
 
-  test(
-    "seeds all student/admin accounts and the full equipment catalogue",
-    () async {
-      final student = await store.login({
-        "role": "student",
-        "account_id": "STUDENT-001",
-        "password": "demo-student",
-      });
-      final equipment = await store.get(
-        "equipment",
-        student["token"] as String,
-      );
-      final items = equipment["items"] as List<JsonMap>;
-      expect(items, hasLength(8));
-      expect(items.map((item) => item["equipment_code"]).toSet(), {
-        "STK-001",
-        "STK-002",
-        "STK-003",
-        "STK-004",
-        "STK-005",
-        "STK-006",
-        "STK-007",
-        "STK-008",
-      });
+  test("borrowing window uses Philippine time and excludes 19:00", () {
+    expect(borrowingWindowOpen(DateTime.utc(2026, 1, 1, 0)), isTrue);
+    expect(borrowingWindowOpen(DateTime.utc(2026, 1, 1, 10, 59)), isTrue);
+    expect(borrowingWindowOpen(DateTime.utc(2026, 1, 1, 11)), isFalse);
+    expect(borrowingWindowOpen(DateTime.utc(2026, 1, 1, 23, 59)), isFalse);
+  });
 
-      await expectLater(
-        store.login({
-          "role": "student",
-          "account_id": "ADMIN-001",
-          "password": "demo-admin",
-        }),
-        throwsA(isA<ApiException>()),
-      );
-    },
-  );
+  test("local initialization does not seed accounts or transactions", () async {
+    final emptyDatabase = await databaseFactory.openDatabase(
+      "${tempDirectory.path}\\empty.db",
+    );
+    await LocalStore.createSchema(emptyDatabase);
+    await LocalStore.seedEquipment(emptyDatabase);
+    expect(await emptyDatabase.query("users"), isEmpty);
+    expect(await emptyDatabase.query("borrowing_requests"), isEmpty);
+    expect(await emptyDatabase.query("borrowing_transactions"), isEmpty);
+    expect(await emptyDatabase.query("equipment"), hasLength(8));
+    await emptyDatabase.close();
+  });
+
+  test("disables self-service registration in offline storage", () async {
+    await expectLater(
+      store.post("register", {}, ""),
+      throwsA(
+        isA<ApiException>()
+            .having((error) => error.statusCode, "status code", 403)
+            .having(
+              (error) => error.message,
+              "message",
+              contains("registration is disabled"),
+            ),
+      ),
+    );
+  });
 
   test("caches MySQL snapshots and preserves queued local changes", () async {
     final student = await store.login({
@@ -131,6 +135,54 @@ void main() {
     await store.removePendingOperation("0123456789abcdef0123456789abcdef");
     expect(await store.pendingOperationCount(), 0);
   });
+
+  test(
+    "admin sees another account's queued request over an empty snapshot",
+    () async {
+      final student = await store.login({
+        "account_id": "STUDENT-001",
+        "password": "demo-student",
+      });
+      final studentToken = student["token"] as String;
+      final studentUser = student["user"] as JsonMap;
+      const requestCode = "REQ-OFFLINE-ADMIN-VISIBILITY";
+      final request = await store.post("create_request", {
+        "equipment_code": "STK-005",
+        "request_code": requestCode,
+      }, studentToken);
+      await store.queuePendingOperation(
+        operationId: "abcdef0123456789abcdef0123456789",
+        accountId: studentUser["account_id"] as String,
+        action: "create_request",
+        body: {"equipment_code": "STK-005", "request_code": requestCode},
+        token: studentToken,
+        result: request,
+      );
+
+      final admin = await store.login({
+        "account_id": "ADMIN-001",
+        "password": "demo-admin",
+      });
+      final adminToken = admin["token"] as String;
+      final adminUser = admin["user"] as JsonMap;
+      await store.cacheRemoteResponse(
+        "requests",
+        adminUser["account_id"] as String,
+        {"requests": <JsonMap>[]},
+      );
+
+      final requests = await store.overlayRemoteSnapshot(
+        "requests",
+        adminUser["account_id"] as String,
+        await store.get("requests", adminToken),
+        adminUser,
+      );
+      expect(
+        (requests["requests"] as List<JsonMap>).single["request_code"],
+        requestCode,
+      );
+    },
+  );
 
   test(
     "caches MySQL borrowings and return reports over seeded SQLite records",
@@ -354,6 +406,19 @@ void main() {
         token: studentToken,
         result: request,
       );
+      await store.cacheRemoteResponse("requests", adminAccount, {
+        "requests": <JsonMap>[],
+      });
+      final adminRequests = await store.overlayRemoteSnapshot(
+        "requests",
+        adminAccount,
+        await store.get("requests", adminToken),
+        admin["user"] as JsonMap,
+      );
+      final visibleRequest =
+          (adminRequests["requests"] as List<JsonMap>).single;
+      expect(visibleRequest["request_code"], requestCode);
+      expect(visibleRequest["_sync_pending"], isTrue);
 
       await store.post("review_request", {
         "request_id": request["request_id"],
@@ -382,6 +447,18 @@ void main() {
         token: studentToken,
         result: returnResult,
       );
+      await store.cacheRemoteResponse("returns", adminAccount, {
+        "returns": <JsonMap>[],
+      });
+      final adminReturns = await store.overlayRemoteSnapshot(
+        "returns",
+        adminAccount,
+        await store.get("returns", adminToken),
+        admin["user"] as JsonMap,
+      );
+      final visibleReturn = (adminReturns["returns"] as List<JsonMap>).single;
+      expect(visibleReturn["request_code"], requestCode);
+      expect(visibleReturn["_sync_pending"], isTrue);
       final report = (await store.get(
         "returns",
         adminToken,
@@ -465,7 +542,7 @@ void main() {
         (row) => row["request_code"] == request["request_code"],
       );
       expect(borrowing["status"], "active");
-      expect(borrowing["student_name"], "Demo Student 1");
+      expect(borrowing["student_name"], "Test Student 1");
 
       const photo = "aGVsbG8=";
       await store.post("create_return", {
@@ -568,7 +645,7 @@ void main() {
         "request_code": requestCode,
         "student_id": 902,
         "account_id": studentAccount,
-        "student_name": "Demo Student 1",
+        "student_name": "Test Student 1",
         "equipment_code": "STK-002",
         "item_name": "Server RGB Keyboard",
         "status": "pending",
@@ -628,7 +705,7 @@ void main() {
             "id": 905,
             "payment_code": paymentCode,
             "account_id": studentAccount,
-            "student_name": "Demo Student 1",
+            "student_name": "Test Student 1",
             "amount": 50.0,
             "method": "Cash",
             "status": "pending",
@@ -658,7 +735,7 @@ void main() {
             "equipment_code": "STK-002",
             "item_name": "Server RGB Keyboard",
             "account_id": adminAccount,
-            "reported_by_name": "Demo Admin 1",
+            "reported_by_name": "Test Admin 1",
             "exception_type": "damaged",
             "quantity": 1,
             "notes": "Server-side inspection",
@@ -702,11 +779,34 @@ void main() {
       });
       final adminToken = admin["token"] as String;
 
-      await store.post("create_payment", {
+      final paymentResult = await store.post("create_payment", {
         "amount": 50,
         "method": "GCash",
         "reference_note": "TEST-50",
       }, studentToken);
+      await store.queuePendingOperation(
+        operationId: "55555555555555555555555555555555",
+        accountId: student["user"]["account_id"] as String,
+        action: "create_payment",
+        body: {"amount": 50, "method": "GCash", "reference_note": "TEST-50"},
+        token: studentToken,
+        result: paymentResult,
+      );
+      await store.cacheRemoteResponse(
+        "payments",
+        admin["user"]["account_id"] as String,
+        {"payments": <JsonMap>[]},
+      );
+      final adminPayments = await store.overlayRemoteSnapshot(
+        "payments",
+        admin["user"]["account_id"] as String,
+        await store.get("payments", adminToken),
+        admin["user"] as JsonMap,
+      );
+      final visiblePayment =
+          (adminPayments["payments"] as List<JsonMap>).single;
+      expect(visiblePayment["reference_note"], "TEST-50");
+      expect(visiblePayment["_sync_pending"], isTrue);
       await expectLater(
         store.post("create_payment", {
           "amount": 151,
@@ -850,5 +950,35 @@ void main() {
       whereArgs: ["account.student_suspended"],
     );
     expect(logs, hasLength(1));
+  });
+}
+
+Future<void> _seedTestUsers(Database database) async {
+  final studentHash = sha256.convert(utf8.encode("demo-student")).toString();
+  final adminHash = sha256.convert(utf8.encode("demo-admin")).toString();
+  for (var index = 1; index <= 6; index++) {
+    await database.insert("users", {
+      "account_id": "STUDENT-${index.toString().padLeft(3, "0")}",
+      "full_name": "Test Student $index",
+      "password_hash": studentHash,
+      "role": "student",
+      "program_section": "BSIT 204",
+    });
+  }
+  for (var index = 1; index <= 2; index++) {
+    await database.insert("users", {
+      "account_id": "ADMIN-${index.toString().padLeft(3, "0")}",
+      "full_name": "Test Admin $index",
+      "password_hash": adminHash,
+      "role": "admin",
+    });
+  }
+  await database.insert("penalties", {
+    "user_id": 1,
+    "amount": 200,
+    "amount_paid": 0,
+    "reason": "Test equipment penalty",
+    "status": "unpaid",
+    "created_at": "2026-01-01T04:00:00.000Z",
   });
 }
